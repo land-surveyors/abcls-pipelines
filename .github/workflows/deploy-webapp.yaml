@@ -1,0 +1,369 @@
+# Deploy the ABCLS webapp Helm chart from land-surveyors/abcls (helm/webapp)
+# to AKS via its Makefile (make upgrade ENV=<env> TAG=<tag>).
+#
+# Trigger: manual dispatch only (GitHub UI: Actions -> "Deploy webapp chart"
+# -> "Run workflow", or `gh workflow run`).
+#
+# Inputs:
+#   env    (required) Target environment: dev, test, or prod. Selects
+#                     helm/webapp/values-<env>.yaml and the abcls-<env>
+#                     namespace (see the chart Makefile).
+#   tag    (required) Image tag, e.g. 0.145.0. A leading 'v' before a digit
+#                     is stripped automatically (v0.145.0 -> 0.145.0).
+#   ref    (optional) Git ref of land-surveyors/abcls to deploy (branch, tag,
+#                     or SHA). Empty (default) = that repo's default branch.
+#   action (optional) Make target in helm/webapp: upgrade (default, helm
+#                     upgrade --install), lint (dry-run upgrade: needs cluster
+#                     access but persists no changes), or template (local
+#                     render only, no cluster access).
+#
+# Required secrets on THIS repo (abcls-pipelines -> Settings -> Secrets):
+#   ABCLS_DEPLOY_KEY   Private half of an SSH deploy key whose public half is
+#                       registered (read-only, WITHOUT "Allow write access")
+#                       on land-surveyors/abcls (Settings -> Deploy keys).
+#                       A deploy key is used instead of a PAT: it is scoped to
+#                       one repo, read-only, not tied to a user, and never
+#                       expires. Setup:
+#                         ssh-keygen -t ed25519 -C "abcls-pipelines" -N "" -f abcls-deploy-key
+#                         # public half -> abcls repo deploy keys (read-only)
+#                         # private half -> this repo's ABCLS_DEPLOY_KEY secret
+#   AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_SUBSCRIPTION_ID / AZURE_TENANT_ID
+#                       Service-principal credentials for azure/login (same
+#                       convention/secret names as the abcls repo).
+#   AKS_RESOURCE_GROUP / AKS_CLUSTER_NAME
+#                       Target AKS cluster for azure/aks-set-context (same
+#                       names as the abcls repo). Not needed when
+#                       action=template.
+#
+# Example:
+#   gh workflow run deploy-webapp.yaml -R land-surveyors/abcls-pipelines \
+#     -f env=test -f tag=0.145.0
+#   gh workflow run deploy-webapp.yaml -R land-surveyors/abcls-pipelines \
+#     -f env=test -f tag=0.145.0 -f ref=v0.145.0
+#   gh workflow run deploy-webapp.yaml -R land-surveyors/abcls-pipelines \
+#     -f env=prod -f tag=0.145.0 -f action=lint
+#
+# What it does:
+#   1. Installs helm/kubectl (asdf via .tool-versions) and azure-cli (pip)
+#      using this repo's ./.github/actions/setup-tools.
+#   2. Checks out land-surveyors/abcls at the explicit `ref`, or at its
+#      default branch when `ref` is empty (via a read-only deploy key).
+#   3. Records the source SHA for the audit trail. The commit subject is
+#      deliberately NOT logged: run logs may be publicly readable.
+#   4. (upgrade only) Renders the chart exactly as it would be deployed
+#      and probes the registry for every referenced image, failing fast
+#      if any tag is missing (a typo'd or never-pushed tag would otherwise
+#      surface later as ImagePullBackOff). Unexpected probe errors fail
+#      closed. Skipped for lint/template, which create no workloads.
+#   5. Logs in to Azure and sets the AKS context (skipped for
+#      action=template, which renders locally without cluster access).
+#   6. Runs `make <action> ENV=<env> TAG=<tag>` in helm/webapp.
+#   7. (upgrade only) Verifies the release status is `deployed` and waits
+#      for the api/client/scheduler rollouts (`make upgrade` does not
+#      --wait, and the data-migration job already runs as a pre-upgrade
+#      hook, so upgrade itself fails if migrations fail).
+
+name: Deploy webapp chart
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Target environment (values-<env>.yaml, namespace abcls-<env>)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+      tag:
+        description: "Image tag (e.g. 0.145.0; a leading 'v' is stripped)"
+        required: true
+        type: string
+      ref:
+        description: 'Git ref of land-surveyors/abcls to deploy (branch, tag, SHA). Empty = default branch.'
+        required: false
+        default: ''
+        type: string
+      action:
+        description: 'Make target: upgrade (deploy), lint (dry-run, needs cluster), template (local render)'
+        required: false
+        default: 'upgrade'
+        type: choice
+        options:
+          - upgrade
+          - lint
+          - template
+
+env:
+  ABCLS_REPO: land-surveyors/abcls
+
+# Deploys to the same environment queue instead of racing each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      # Pipelines checkout stays at the workspace root: setup-tools needs
+      # .tool-versions and requirements.txt from this repo.
+      - name: Checkout pipelines repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Tools
+        uses: ./.github/actions/setup-tools
+
+      # Two conditional checkouts instead of resolving the default branch via
+      # the API: no API token needed, and the SSH deploy key (ssh-key) is the
+      # only credential. When `ref` is omitted, checkout uses the external
+      # repo's default branch (documented actions/checkout behavior).
+      # `path` keeps the pipelines checkout above intact at the root.
+      - name: Checkout ${{ env.ABCLS_REPO }} (explicit ref)
+        if: ${{ inputs.ref != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          repository: ${{ env.ABCLS_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: abcls
+
+      - name: Checkout ${{ env.ABCLS_REPO }} (default branch)
+        if: ${{ inputs.ref == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          repository: ${{ env.ABCLS_REPO }}
+          ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: abcls
+
+      - name: Record source
+        id: source
+        working-directory: abcls
+        env:
+          REF_INPUT: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          # Attached HEAD (branch checkout, explicit or default): report the
+          # branch name. Detached HEAD (tag/SHA): fall back to the input ref.
+          branch="$(git branch --show-current || true)"
+          if [ -n "${branch}" ]; then
+            ref="${branch}"
+          else
+            ref="${REF_INPUT}"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          # NOTE: the commit subject is deliberately NOT logged — workflow run
+          # logs of a public repo are world-readable.
+          echo "Deploying chart from ${sha} (${ref})"
+
+      # Fail fast (before touching Azure/the cluster) if any image the chart
+      # would deploy does not exist in the registry — e.g. a typo'd tag or
+      # images that were never pushed. Renders via `make template` so the
+      # probed refs are exactly what `make upgrade` would deploy, including
+      # per-env values overrides. Upgrade only: lint/template create no
+      # workloads, so a missing tag must not block a dry-run/render.
+      - name: Check images exist
+        if: ${{ inputs.action == 'upgrade' }}
+        working-directory: abcls/helm/webapp
+        env:
+          MAKE_ENV: ${{ inputs.env }}
+          TAG_INPUT: ${{ inputs.tag }}
+          REGISTRY_USERNAME: ${{ secrets.AZURE_CLIENT_ID }}
+          REGISTRY_PASSWORD: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          case "${MAKE_ENV}" in
+            dev|test|prod) ;;
+            *)
+              echo "error: env must be one of: dev, test, prod (got '${MAKE_ENV}')." >&2
+              exit 1
+              ;;
+          esac
+          # Mirror the deploy step normalization (trim; strip one leading 'v'
+          # before a digit) so we probe the exact refs it would deploy.
+          tag="$(printf '%s' "${TAG_INPUT}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          case "${tag}" in
+            v[0-9]*) tag="${tag#v}" ;;
+          esac
+          if [ -z "${tag}" ]; then
+            echo 'error: tag must not be empty.' >&2
+            exit 1
+          fi
+          rendered="$(make -s template ENV="${MAKE_ENV}" TAG="${tag}")"
+          mapfile -t images < <(printf '%s\n' "${rendered}" | awk '$1 == "image:" { gsub(/"/, "", $2); print $2 }' | sort -u)
+          if [ "${#images[@]}" -eq 0 ]; then
+            echo 'error: no images found in the rendered chart; refusing to deploy blind.' >&2
+            exit 1
+          fi
+          echo "Rendered chart references ${#images[@]} image(s):"
+          printf '  %s\n' "${images[@]}"
+          if [ -z "${REGISTRY_USERNAME}" ] || [ -z "${REGISTRY_PASSWORD}" ]; then
+            echo 'error: AZURE_CLIENT_ID / AZURE_CLIENT_SECRET secrets are required to probe the registry.' >&2
+            exit 1
+          fi
+          # Fail-closed probing: only manifest-missing errors count as "image
+          # does not exist". Any other probe error aborts the run so a flaky
+          # registry can never silently disarm the guard.
+          mapfile -t hosts < <(printf '%s\n' "${images[@]}" | cut -d/ -f1 | sort -u)
+          for host in "${hosts[@]}"; do
+            printf '%s' "${REGISTRY_PASSWORD}" | docker login "${host}" -u "${REGISTRY_USERNAME}" --password-stdin > /dev/null
+          done
+          missing=''
+          missing_count=0
+          for ref in "${images[@]}"; do
+            if probe_err="$(docker buildx imagetools inspect "${ref}" 2>&1 >/dev/null)"; then
+              echo "  ok: ${ref}"
+            elif printf '%s' "${probe_err}" | grep -qiE 'manifest unknown|no such manifest|not found|not exist'; then
+              missing="${missing}${missing:+,}${ref}"
+              missing_count=$((missing_count + 1))
+            else
+              echo "error: registry probe failed for '${ref}' — cannot tell whether the image exists, failing closed:" >&2
+              printf '%s\n' "${probe_err}" | head -5 >&2
+              exit 1
+            fi
+          done
+          for host in "${hosts[@]}"; do
+            docker logout "${host}" > /dev/null 2>&1 || true
+          done
+          if [ "${missing_count}" -gt 0 ]; then
+            echo "error: ${missing_count} image(s) referenced by the chart do not exist — build and push tag '${tag}' first (Actions -> 'Build and push images'): ${missing}" >&2
+            exit 1
+          fi
+          echo "All ${#images[@]} image(s) exist; proceeding."
+
+      # Same Azure login pattern as the abcls repo deploy workflows. Skipped
+      # for action=template, which renders locally without cluster access.
+      - name: Set AZURE_CREDENTIALS environment variable
+        if: ${{ inputs.action != 'template' }}
+        run: |
+          echo "AZURE_CREDENTIALS={\"clientSecret\": \"${{ secrets.AZURE_CLIENT_SECRET }}\", \"subscriptionId\": \"${{ secrets.AZURE_SUBSCRIPTION_ID }}\", \"tenantId\": \"${{ secrets.AZURE_TENANT_ID }}\", \"clientId\": \"${{ secrets.AZURE_CLIENT_ID }}\"}" >> $GITHUB_ENV
+
+      - name: Azure login
+        if: ${{ inputs.action != 'template' }}
+        id: login
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906
+        with:
+          creds: ${{ env.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        if: ${{ inputs.action != 'template' }}
+        id: set-context
+        uses: azure/aks-set-context@883bdc8d8d1d0fd87e66cc4ba6f0b618f9eb5281
+        with:
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Deploy with Helm chart Makefile
+        working-directory: abcls/helm/webapp
+        env:
+          MAKE_ENV: ${{ inputs.env }}
+          TAG_INPUT: ${{ inputs.tag }}
+          MAKE_ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          case "${MAKE_ENV}" in
+            dev|test|prod) ;;
+            *)
+              echo "error: env must be one of: dev, test, prod (got '${MAKE_ENV}')." >&2
+              exit 1
+              ;;
+          esac
+          case "${MAKE_ACTION}" in
+            upgrade|lint|template) ;;
+            *)
+              echo "error: action must be one of: upgrade, lint, template (got '${MAKE_ACTION}')." >&2
+              exit 1
+              ;;
+          esac
+          # Mirror the build-images normalization (trim; strip one leading 'v'
+          # before a digit) so the deployed tag matches the pushed images.
+          tag="$(printf '%s' "${TAG_INPUT}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          case "${tag}" in
+            v[0-9]*) tag="${tag#v}" ;;
+          esac
+          if [ -z "${tag}" ]; then
+            echo 'error: tag must not be empty.' >&2
+            exit 1
+          fi
+          helm version
+          make "${MAKE_ACTION}" ENV="${MAKE_ENV}" TAG="${tag}"
+
+      # `make upgrade` does not --wait: it succeeds once manifests are
+      # accepted. Upgrade only: assert the release is `deployed` and wait for
+      # the rollouts. (The data-migration job runs as a pre-upgrade hook, so
+      # `make upgrade` itself already fails if migrations fail.)
+      - name: Verify rollout
+        if: ${{ inputs.action == 'upgrade' }}
+        env:
+          MAKE_ENV: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          namespace="abcls-${MAKE_ENV}"
+          helm status webapp -n "${namespace}"
+          status="$(helm status webapp -n "${namespace}" -o json | jq -r '.info.status')"
+          if [ "${status}" != 'deployed' ]; then
+            echo "error: expected release status 'deployed', got '${status}'." >&2
+            exit 1
+          fi
+          kubectl rollout status deployment/webapp-api -n "${namespace}" --timeout=10m
+          # client and scheduler are disabled in some envs: wait only when
+          # the deployment exists. A lookup failure other than NotFound
+          # aborts (fail-closed) instead of silently skipping the wait.
+          for name in webapp-client webapp-scheduler; do
+            if get_err="$(kubectl get "deployment/${name}" -n "${namespace}" 2>&1 >/dev/null)"; then
+              kubectl rollout status "deployment/${name}" -n "${namespace}" --timeout=10m
+            elif printf '%s' "${get_err}" | grep -qi 'not found'; then
+              echo "deployment/${name} not present in ${namespace}; skipping."
+            else
+              echo "error: failed to check deployment/${name} in ${namespace}:" >&2
+              printf '%s\n' "${get_err}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Write summary
+        if: success()
+        env:
+          MAKE_ENV: ${{ inputs.env }}
+          TAG_INPUT: ${{ inputs.tag }}
+          MAKE_ACTION: ${{ inputs.action }}
+          SOURCE_REF: ${{ steps.source.outputs.ref }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Mirror the deploy step normalization (trim; strip one leading 'v'
+          # before a digit) so the summary shows the real deployed tag.
+          tag="$(printf '%s' "${TAG_INPUT}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          case "${tag}" in
+            v[0-9]*) tag="${tag#v}" ;;
+          esac
+          {
+            if [ "${MAKE_ACTION}" = 'upgrade' ]; then
+              echo '## Webapp chart deployed'
+            else
+              echo "## Webapp chart dry-run (${MAKE_ACTION})"
+            fi
+            echo ''
+            echo "- Source: \`${{ env.ABCLS_REPO }}@${SOURCE_REF}\` (\`${SOURCE_SHA}\`)"
+            echo "- Command: \`make ${MAKE_ACTION} ENV=${MAKE_ENV} TAG=${tag}\`"
+            echo "- Namespace: \`abcls-${MAKE_ENV}\`"
+            echo "- Image tag: \`${tag}\`"
+            # This step runs only on success, so for upgrade the preflight
+            # and rollout verification above both passed.
+            if [ "${MAKE_ACTION}" = 'upgrade' ]; then
+              echo '- Post-deploy checks: release status `deployed`, rollout(s) complete'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
