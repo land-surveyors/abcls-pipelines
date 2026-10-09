@@ -12,13 +12,18 @@
 #   registry (optional) Target registry, e.g. abclsacr.azurecr.io.
 #   images   (optional) Comma list from: client,api,data-migration.
 #   overwrite (optional) 'true' to rebuild tags that already exist in the
-#                       registry. Default: false (see step 2 below).
+#                       registry. Default: false (see step 1 below).
 #
 # Required secrets on THIS repo (abcls-pipelines -> Settings -> Secrets):
-#   ABCLS_REPO_TOKEN   PAT with read access to land-surveyors/abcls
-#                       (classic: `repo` scope; or fine-grained with
-#                       Contents: Read on that repo). GITHUB_TOKEN cannot read
-#                       across repos, hence this secret.
+#   ABCLS_DEPLOY_KEY   Private half of an SSH deploy key whose public half is
+#                       registered (read-only, WITHOUT "Allow write access")
+#                       on land-surveyors/abcls (Settings -> Deploy keys).
+#                       A deploy key is used instead of a PAT: it is scoped to
+#                       one repo, read-only, not tied to a user, and never
+#                       expires. Setup:
+#                         ssh-keygen -t ed25519 -C "abcls-pipelines" -N "" -f abcls-deploy-key
+#                         # public half -> abcls repo deploy keys (read-only)
+#                         # private half -> this repo's ABCLS_DEPLOY_KEY secret
 #   AZURE_CLIENT_ID / AZURE_CLIENT_SECRET
 #                       Service-principal credentials used as the ACR docker
 #                       login (same convention/secret names as the abcls repo).
@@ -34,15 +39,17 @@
 #     -f tag=0.145.0 -f ref=v0.145.0 -f images=api
 #
 # What it does:
-#   1. Resolves the source ref (explicit `ref`, else the abcls default branch).
-#   2. Probes the registry and fails fast if ALL selected tags already exist
+#   1. Probes the registry and fails fast if ALL selected tags already exist
 #      (probable accidental re-dispatch; set overwrite=true to force).
 #      Unexpected probe errors also fail fast (fail-closed) rather than
 #      passing silently as "tag missing".
 #      Partial matches only warn and proceed (probable retry after a
 #      partial push: the build script pushes sequentially and stops at
 #      the first failure).
-#   3. Checks out land-surveyors/abcls at that ref.
+#   2. Checks out land-surveyors/abcls at the explicit `ref`, or at its
+#      default branch when `ref` is empty (via a read-only deploy key).
+#   3. Records the source SHA for the audit trail. The commit subject is
+#      deliberately NOT logged: run logs may be publicly readable.
 #   4. Runs its scripts/build-images.sh with PUSH=true LOGIN=true.
 
 name: Build and push images
@@ -91,22 +98,6 @@ jobs:
       contents: read
 
     steps:
-      - name: Resolve source ref
-        id: source
-        env:
-          GH_TOKEN: ${{ secrets.ABCLS_REPO_TOKEN }}
-          REF_INPUT: ${{ inputs.ref }}
-        run: |
-          set -euo pipefail
-          if [ -n "${REF_INPUT}" ]; then
-            echo "ref=${REF_INPUT}" >> "$GITHUB_OUTPUT"
-            echo "Using explicit ref: ${REF_INPUT}"
-          else
-            default_branch="$(gh api "repos/${{ env.ABCLS_REPO }}" --jq .default_branch)"
-            echo "ref=${default_branch}" >> "$GITHUB_OUTPUT"
-            echo "Using default branch: ${default_branch}"
-          fi
-
       - name: Check existing tags
         env:
           TAG_INPUT: ${{ inputs.tag }}
@@ -180,20 +171,49 @@ jobs:
             echo "No existing tags for '${tag}'; proceeding."
           fi
 
-      - name: Checkout ${{ env.ABCLS_REPO }}
+      # Two conditional checkouts instead of resolving the default branch via
+      # the API: no API token needed, and the SSH deploy key (ssh-key) is the
+      # only credential. When `ref` is omitted, checkout uses the external
+      # repo's default branch (documented actions/checkout behavior).
+      - name: Checkout ${{ env.ABCLS_REPO }} (explicit ref)
+        if: ${{ inputs.ref != '' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           repository: ${{ env.ABCLS_REPO }}
-          ref: ${{ steps.source.outputs.ref }}
-          token: ${{ secrets.ABCLS_REPO_TOKEN }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Record source SHA
-        id: sha
+      - name: Checkout ${{ env.ABCLS_REPO }} (default branch)
+        if: ${{ inputs.ref == '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          repository: ${{ env.ABCLS_REPO }}
+          ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record source
+        id: source
+        env:
+          REF_INPUT: ${{ inputs.ref }}
         run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          git log -1 --format='Built from %H (%s)'
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          # Attached HEAD (branch checkout, explicit or default): report the
+          # branch name. Detached HEAD (tag/SHA): fall back to the input ref.
+          branch="$(git branch --show-current || true)"
+          if [ -n "${branch}" ]; then
+            ref="${branch}"
+          else
+            ref="${REF_INPUT}"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          # NOTE: the commit subject is deliberately NOT logged — workflow run
+          # logs of a public repo are world-readable.
+          echo "Built from ${sha} (${ref})"
 
       - name: Build and push images
         env:
@@ -222,7 +242,7 @@ jobs:
           DOCKER_REGISTRY: ${{ inputs.registry }}
           IMAGES: ${{ inputs.images }}
           SOURCE_REF: ${{ steps.source.outputs.ref }}
-          SOURCE_SHA: ${{ steps.sha.outputs.sha }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
           set -euo pipefail
           # Mirror the script's normalization (trim; strip one leading 'v'
