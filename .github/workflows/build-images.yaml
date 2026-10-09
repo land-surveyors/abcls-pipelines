@@ -58,23 +58,23 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Image tag (e.g. 0.145.0; a leading 'v' is stripped)"
+        description: Image tag (e.g. 0.145.0; a leading 'v' is stripped)
         required: true
         type: string
       ref:
-        description: 'Git ref of land-surveyors/abcls to build (branch, tag, SHA). Empty = default branch.'
+        description: Git ref of land-surveyors/abcls to build (branch, tag, SHA). Empty = default branch.
         required: false
         default: ''
         type: string
       registry:
-        description: 'Target container registry'
+        description: Target container registry
         required: false
-        default: 'abclsacr.azurecr.io'
+        default: abclsacr.azurecr.io
         type: string
       images:
         description: 'Comma list from: client,api,data-migration'
         required: false
-        default: 'client,api,data-migration'
+        default: client,api,data-migration
         type: string
       overwrite:
         description: "'true' to rebuild tags that already exist in the registry"
@@ -98,172 +98,172 @@ jobs:
       contents: read
 
     steps:
-      - name: Check existing tags
-        env:
-          TAG_INPUT: ${{ inputs.tag }}
-          DOCKER_REGISTRY: ${{ inputs.registry }}
-          IMAGES: ${{ inputs.images }}
-          OVERWRITE: ${{ inputs.overwrite }}
-          REGISTRY_USERNAME: ${{ secrets.AZURE_CLIENT_ID }}
-          REGISTRY_PASSWORD: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: |
-          set -euo pipefail
-          # Mirror the script's normalization (trim; strip one leading 'v'
-          # before a digit) so we probe the exact references it would push.
-          # Invalid tags/images are NOT rejected here: the probe simply finds
-          # nothing and the build script below reports the real error.
-          # Fail-closed probing: only manifest-missing errors count as "tag
-          # does not exist". Any other probe error aborts the run (unless
-          # overwrite=true, which treats it as missing with a warning) so a
-          # flaky registry can never silently disarm the guard.
-          tag="$(printf '%s' "${TAG_INPUT}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-          case "${tag}" in
-            v[0-9]*) tag="${tag#v}" ;;
-          esac
-          registry="$(printf '%s' "${DOCKER_REGISTRY}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
-          if [ -z "${REGISTRY_USERNAME}" ] || [ -z "${REGISTRY_PASSWORD}" ]; then
-            echo 'error: AZURE_CLIENT_ID / AZURE_CLIENT_SECRET secrets are required to probe the registry.' >&2
-            exit 1
-          fi
-          printf '%s' "${REGISTRY_PASSWORD}" | docker login "${registry}" -u "${REGISTRY_USERNAME}" --password-stdin > /dev/null
-          existing=''
-          existing_count=0
-          total=0
-          IFS=',' read -r -a parts <<< "${IMAGES}" || true
-          for raw in "${parts[@]}"; do
-            key="$(printf '%s' "${raw}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            [ -z "${key}" ] && continue
-            total=$((total + 1))
-            probe_ref="${registry}/abcls-${key}:${tag}"
-            if probe_err="$(docker buildx imagetools inspect "${probe_ref}" 2>&1 >/dev/null)"; then
-              existing="${existing}${existing:+,}${key}"
-              existing_count=$((existing_count + 1))
-            elif printf '%s' "${probe_err}" | grep -qiE 'manifest unknown|no such manifest|not found|not exist'; then
-              : # genuinely missing — nothing to record
-            elif [ "${OVERWRITE}" = 'true' ]; then
-              first_line="$(printf '%s' "${probe_err}" | head -1)"
-              echo "::warning::registry probe for '${probe_ref}' failed (${first_line}); overwrite=true, treating as missing."
-            else
-              echo "error: registry probe failed for '${probe_ref}' — cannot tell whether the tag exists, failing closed:" >&2
-              printf '%s\n' "${probe_err}" | head -5 >&2
-              exit 1
-            fi
-          done
-          if [ "${total}" -eq 0 ]; then
-            echo 'No images selected; leaving validation to the build script.'
-            exit 0
-          fi
-          if [ "${OVERWRITE}" = 'true' ]; then
-            if [ "${existing_count}" -gt 0 ]; then
-              echo "::warning::overwrite=true: will rebuild existing tag(s): ${existing} (${registry}/abcls-*:${tag})"
-            else
-              echo "overwrite=true: no existing tags for '${tag}'; proceeding."
-            fi
-            exit 0
-          fi
-          if [ "${existing_count}" -eq "${total}" ]; then
-            echo "error: all ${total} tag(s) already exist for '${tag}' (${existing}); re-running would overwrite pushed images. Set overwrite=true to force a rebuild." >&2
-            exit 1
-          fi
-          if [ "${existing_count}" -gt 0 ]; then
-            echo "::warning::${existing_count}/${total} tag(s) already exist for '${tag}' (${existing}); proceeding (likely a retry after a partial push)."
+    - name: Check existing tags
+      env:
+        TAG_INPUT: ${{ inputs.tag }}
+        DOCKER_REGISTRY: ${{ inputs.registry }}
+        IMAGES: ${{ inputs.images }}
+        OVERWRITE: ${{ inputs.overwrite }}
+        REGISTRY_USERNAME: ${{ secrets.AZURE_CLIENT_ID }}
+        REGISTRY_PASSWORD: ${{ secrets.AZURE_CLIENT_SECRET }}
+      run: |
+        set -euo pipefail
+        # Mirror the script's normalization (trim; strip one leading 'v'
+        # before a digit) so we probe the exact references it would push.
+        # Invalid tags/images are NOT rejected here: the probe simply finds
+        # nothing and the build script below reports the real error.
+        # Fail-closed probing: only manifest-missing errors count as "tag
+        # does not exist". Any other probe error aborts the run (unless
+        # overwrite=true, which treats it as missing with a warning) so a
+        # flaky registry can never silently disarm the guard.
+        tag="$(printf '%s' "${TAG_INPUT}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        case "${tag}" in
+          v[0-9]*) tag="${tag#v}" ;;
+        esac
+        registry="$(printf '%s' "${DOCKER_REGISTRY}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
+        if [ -z "${REGISTRY_USERNAME}" ] || [ -z "${REGISTRY_PASSWORD}" ]; then
+          echo 'error: AZURE_CLIENT_ID / AZURE_CLIENT_SECRET secrets are required to probe the registry.' >&2
+          exit 1
+        fi
+        printf '%s' "${REGISTRY_PASSWORD}" | docker login "${registry}" -u "${REGISTRY_USERNAME}" --password-stdin > /dev/null
+        existing=''
+        existing_count=0
+        total=0
+        IFS=',' read -r -a parts <<< "${IMAGES}" || true
+        for raw in "${parts[@]}"; do
+          key="$(printf '%s' "${raw}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          [ -z "${key}" ] && continue
+          total=$((total + 1))
+          probe_ref="${registry}/abcls-${key}:${tag}"
+          if probe_err="$(docker buildx imagetools inspect "${probe_ref}" 2>&1 >/dev/null)"; then
+            existing="${existing}${existing:+,}${key}"
+            existing_count=$((existing_count + 1))
+          elif printf '%s' "${probe_err}" | grep -qiE 'manifest unknown|no such manifest|not found|not exist'; then
+            : # genuinely missing — nothing to record
+          elif [ "${OVERWRITE}" = 'true' ]; then
+            first_line="$(printf '%s' "${probe_err}" | head -1)"
+            echo "::warning::registry probe for '${probe_ref}' failed (${first_line}); overwrite=true, treating as missing."
           else
-            echo "No existing tags for '${tag}'; proceeding."
+            echo "error: registry probe failed for '${probe_ref}' — cannot tell whether the tag exists, failing closed:" >&2
+            printf '%s\n' "${probe_err}" | head -5 >&2
+            exit 1
           fi
+        done
+        if [ "${total}" -eq 0 ]; then
+          echo 'No images selected; leaving validation to the build script.'
+          exit 0
+        fi
+        if [ "${OVERWRITE}" = 'true' ]; then
+          if [ "${existing_count}" -gt 0 ]; then
+            echo "::warning::overwrite=true: will rebuild existing tag(s): ${existing} (${registry}/abcls-*:${tag})"
+          else
+            echo "overwrite=true: no existing tags for '${tag}'; proceeding."
+          fi
+          exit 0
+        fi
+        if [ "${existing_count}" -eq "${total}" ]; then
+          echo "error: all ${total} tag(s) already exist for '${tag}' (${existing}); re-running would overwrite pushed images. Set overwrite=true to force a rebuild." >&2
+          exit 1
+        fi
+        if [ "${existing_count}" -gt 0 ]; then
+          echo "::warning::${existing_count}/${total} tag(s) already exist for '${tag}' (${existing}); proceeding (likely a retry after a partial push)."
+        else
+          echo "No existing tags for '${tag}'; proceeding."
+        fi
 
       # Two conditional checkouts instead of resolving the default branch via
       # the API: no API token needed, and the SSH deploy key (ssh-key) is the
       # only credential. When `ref` is omitted, checkout uses the external
       # repo's default branch (documented actions/checkout behavior).
-      - name: Checkout ${{ env.ABCLS_REPO }} (explicit ref)
-        if: ${{ inputs.ref != '' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
-        with:
-          repository: ${{ env.ABCLS_REPO }}
-          ref: ${{ inputs.ref }}
-          ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
-          fetch-depth: 1
-          persist-credentials: false
+    - name: Checkout ${{ env.ABCLS_REPO }} (explicit ref)
+      if: ${{ inputs.ref != '' }}
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
+      with:
+        repository: ${{ env.ABCLS_REPO }}
+        ref: ${{ inputs.ref }}
+        ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
+        fetch-depth: 1
+        persist-credentials: false
 
-      - name: Checkout ${{ env.ABCLS_REPO }} (default branch)
-        if: ${{ inputs.ref == '' }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
-        with:
-          repository: ${{ env.ABCLS_REPO }}
-          ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
-          fetch-depth: 1
-          persist-credentials: false
+    - name: Checkout ${{ env.ABCLS_REPO }} (default branch)
+      if: ${{ inputs.ref == '' }}
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
+      with:
+        repository: ${{ env.ABCLS_REPO }}
+        ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
+        fetch-depth: 1
+        persist-credentials: false
 
-      - name: Record source
-        id: source
-        env:
-          REF_INPUT: ${{ inputs.ref }}
-        run: |
-          set -euo pipefail
-          sha="$(git rev-parse HEAD)"
-          # Attached HEAD (branch checkout, explicit or default): report the
-          # branch name. Detached HEAD (tag/SHA): fall back to the input ref.
-          branch="$(git branch --show-current || true)"
-          if [ -n "${branch}" ]; then
-            ref="${branch}"
-          else
-            ref="${REF_INPUT}"
-          fi
-          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
-          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
-          # NOTE: the commit subject is deliberately NOT logged — workflow run
-          # logs of a public repo are world-readable.
-          echo "Built from ${sha} (${ref})"
+    - name: Record source
+      id: source
+      env:
+        REF_INPUT: ${{ inputs.ref }}
+      run: |
+        set -euo pipefail
+        sha="$(git rev-parse HEAD)"
+        # Attached HEAD (branch checkout, explicit or default): report the
+        # branch name. Detached HEAD (tag/SHA): fall back to the input ref.
+        branch="$(git branch --show-current || true)"
+        if [ -n "${branch}" ]; then
+          ref="${branch}"
+        else
+          ref="${REF_INPUT}"
+        fi
+        echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+        echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+        # NOTE: the commit subject is deliberately NOT logged — workflow run
+        # logs of a public repo are world-readable.
+        echo "Built from ${sha} (${ref})"
 
-      - name: Build and push images
-        env:
-          IMAGE_TAG: ${{ inputs.tag }}
-          DOCKER_REGISTRY: ${{ inputs.registry }}
-          IMAGES: ${{ inputs.images }}
-          PUSH: 'true'
-          LOGIN: 'true'
-          REQUIRE_FRONTEND_KEYS: 'true'
-          REGISTRY_USERNAME: ${{ secrets.AZURE_CLIENT_ID }}
-          REGISTRY_PASSWORD: ${{ secrets.AZURE_CLIENT_SECRET }}
-          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
-          TINYMCE_API_KEY: ${{ secrets.TINYMCE_API_KEY }}
-        run: ./scripts/build-images.sh
+    - name: Build and push images
+      env:
+        IMAGE_TAG: ${{ inputs.tag }}
+        DOCKER_REGISTRY: ${{ inputs.registry }}
+        IMAGES: ${{ inputs.images }}
+        PUSH: 'true'
+        LOGIN: 'true'
+        REQUIRE_FRONTEND_KEYS: 'true'
+        REGISTRY_USERNAME: ${{ secrets.AZURE_CLIENT_ID }}
+        REGISTRY_PASSWORD: ${{ secrets.AZURE_CLIENT_SECRET }}
+        GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
+        TINYMCE_API_KEY: ${{ secrets.TINYMCE_API_KEY }}
+      run: ./scripts/build-images.sh
 
-      - name: Log out of registry
-        if: always()
-        env:
-          DOCKER_REGISTRY: ${{ inputs.registry }}
-        run: docker logout "${DOCKER_REGISTRY}" || true
+    - name: Log out of registry
+      if: always()
+      env:
+        DOCKER_REGISTRY: ${{ inputs.registry }}
+      run: docker logout "${DOCKER_REGISTRY}" || true
 
-      - name: Write summary
-        if: success()
-        env:
-          TAG_INPUT: ${{ inputs.tag }}
-          DOCKER_REGISTRY: ${{ inputs.registry }}
-          IMAGES: ${{ inputs.images }}
-          SOURCE_REF: ${{ steps.source.outputs.ref }}
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-        run: |
-          set -euo pipefail
-          # Mirror the script's normalization (trim; strip one leading 'v'
-          # before a digit) so the summary shows the real pushed references.
-          tag="$(printf '%s' "${TAG_INPUT}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-          case "${tag}" in
-            v[0-9]*) tag="${tag#v}" ;;
-          esac
-          registry="$(printf '%s' "${DOCKER_REGISTRY}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
-          {
-            echo '## Images pushed'
-            echo ''
-            echo "- Source: \`${{ env.ABCLS_REPO }}@${SOURCE_REF}\` (\`${SOURCE_SHA}\`)"
-            echo "- Tag: \`${tag}\`"
-            echo ''
-            echo '| Image | Reference |'
-            echo '| --- | --- |'
-            IFS=',' read -r -a parts <<< "${IMAGES}" || true
-            for raw in "${parts[@]}"; do
-              key="$(printf '%s' "${raw}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-              [ -z "${key}" ] && continue
-              echo "| ${key} | \`${registry}/abcls-${key}:${tag}\` |"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
+    - name: Write summary
+      if: success()
+      env:
+        TAG_INPUT: ${{ inputs.tag }}
+        DOCKER_REGISTRY: ${{ inputs.registry }}
+        IMAGES: ${{ inputs.images }}
+        SOURCE_REF: ${{ steps.source.outputs.ref }}
+        SOURCE_SHA: ${{ steps.source.outputs.sha }}
+      run: |
+        set -euo pipefail
+        # Mirror the script's normalization (trim; strip one leading 'v'
+        # before a digit) so the summary shows the real pushed references.
+        tag="$(printf '%s' "${TAG_INPUT}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        case "${tag}" in
+          v[0-9]*) tag="${tag#v}" ;;
+        esac
+        registry="$(printf '%s' "${DOCKER_REGISTRY}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's:/*$::')"
+        {
+          echo '## Images pushed'
+          echo ''
+          echo "- Source: \`${{ env.ABCLS_REPO }}@${SOURCE_REF}\` (\`${SOURCE_SHA}\`)"
+          echo "- Tag: \`${tag}\`"
+          echo ''
+          echo '| Image | Reference |'
+          echo '| --- | --- |'
+          IFS=',' read -r -a parts <<< "${IMAGES}" || true
+          for raw in "${parts[@]}"; do
+            key="$(printf '%s' "${raw}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "${key}" ] && continue
+            echo "| ${key} | \`${registry}/abcls-${key}:${tag}\` |"
+          done
+        } >> "$GITHUB_STEP_SUMMARY"
