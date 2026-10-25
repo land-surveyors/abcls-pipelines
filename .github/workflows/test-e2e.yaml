@@ -1,0 +1,112 @@
+# Run Playwright against the local ABCLS Compose sandbox.
+# Required secret: ABCLS_DEPLOY_KEY (same read-only key as build/deploy).
+# Example:
+#   gh workflow run test-e2e.yaml -R land-surveyors/abcls-pipelines \
+#     -f ref=main -f suite=rbac
+#   gh workflow run test-e2e.yaml -R land-surveyors/abcls-pipelines \
+#     -f suite=admin-email
+
+name: Test E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref of land-surveyors/abcls (branch, tag, SHA). Empty = default branch.
+        required: false
+        default: ''
+        type: string
+      suite:
+        description: Playwright suite. Default excludes opt-in admin-email and quarantined legacy tests.
+        required: true
+        default: default
+        type: choice
+        options:
+        - default
+        - auth
+        - org
+        - user
+        - complaint
+        - checklist
+        - cpd
+        - rbac
+        - message
+        - survey-plan
+        - career
+        - admin-email
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref || 'default' }}-${{ inputs.suite }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      E2E_SUITE: ${{ inputs.suite }}
+      # The admin-email fixture pins this path; use it for every suite so the
+      # browser installed below is also available to that opt-in fixture.
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/abcls/e2e/node_modules/.cache/email07/browsers
+
+    steps:
+    - name: Checkout pipelines repo
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
+      with:
+        persist-credentials: false
+
+    - name: Setup ABCLS tests
+      uses: ./.github/actions/setup-abcls-tests
+      with:
+        ref: ${{ inputs.ref }}
+        ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
+        packages: |
+          abcls
+          abcls/api-ts
+          abcls/client
+          abcls/e2e
+
+    - name: Install wkhtmltopdf
+      run: sudo apt-get update && sudo apt-get install -y wkhtmltopdf
+
+    - name: Prepare E2E configuration
+      working-directory: abcls
+      run: |
+        cp api-ts/.env.e2e.example api-ts/.env.e2e
+        cp e2e/.env.e2e.example e2e/.env.e2e
+        cp ../.github/tests/playwright.ci.config.ts e2e/playwright.ci.config.ts
+
+    - name: Install Playwright browser
+      run: pnpm --dir abcls/e2e exec playwright install --with-deps chromium
+
+    - name: Build admin-email worker
+      if: ${{ inputs.suite == 'admin-email' }}
+      run: pnpm --dir abcls/api-ts run build
+
+    - name: Run E2E sandbox
+      working-directory: abcls
+      run: pnpm --config.verifyDepsBeforeRun=false exec repo-toolkit-compose-sandbox --config ../.github/tests/compose-sandbox.mjs
+
+    - name: Upload E2E service logs
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+      with:
+        name: e2e-service-logs-${{ inputs.suite }}
+        path: abcls/sandbox/test-logs/
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Upload Playwright reports
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+      with:
+        name: e2e-test-reports-${{ inputs.suite }}
+        path: |
+          abcls/e2e/playwright-report/
+          abcls/e2e/test-results/
+          abcls/e2e/results/
+          abcls/e2e/screenshots/
+        if-no-files-found: ignore
+        retention-days: 7

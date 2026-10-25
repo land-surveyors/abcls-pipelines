@@ -1,0 +1,64 @@
+# Run the Angular/Karma suite from land-surveyors/abcls in headless Chrome.
+# Required secret: ABCLS_DEPLOY_KEY (same read-only key as build/deploy).
+# Example:
+#   gh workflow run test-client.yaml -R land-surveyors/abcls-pipelines \
+#     -f ref=main -f coverage=true
+
+name: Test client
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref of land-surveyors/abcls (branch, tag, SHA). Empty = default branch.
+        required: false
+        default: ''
+        type: string
+      coverage:
+        description: Generate a Karma coverage report
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref || 'default' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout pipelines repo
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
+      with:
+        persist-credentials: false
+
+    - name: Setup ABCLS tests
+      uses: ./.github/actions/setup-abcls-tests
+      with:
+        ref: ${{ inputs.ref }}
+        ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
+        packages: abcls/client
+
+    - name: Run client tests
+      working-directory: abcls/client
+      env:
+        CI: 'true'
+        # Chrome is preinstalled on GitHub's ubuntu-24.04 runners.
+        CHROME_BIN: /usr/bin/google-chrome
+        NODE_OPTIONS: --max-old-space-size=4096
+        COVERAGE: ${{ inputs.coverage }}
+      run: pnpm test --watch=false --browsers=ChromeHeadless --progress=false "--code-coverage=${COVERAGE}"
+
+    - name: Upload client coverage
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+      with:
+        name: client-test-coverage
+        path: abcls/client/coverage/
+        if-no-files-found: ignore
+        retention-days: 7

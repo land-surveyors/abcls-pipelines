@@ -1,0 +1,94 @@
+name: Setup ABCLS tests
+description: Checkout ABCLS and install its pinned Node.js, pnpm, and test dependencies
+
+inputs:
+  ref:
+    description: Git ref of land-surveyors/abcls. Empty = default branch.
+    required: false
+    default: ''
+  ssh-key:
+    description: Read-only deploy key for land-surveyors/abcls
+    required: true
+  packages:
+    description: Newline-separated package paths relative to the workspace (e.g. abcls/api-ts)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Keep the pipelines checkout at the root so its actions/configs remain
+    # available. Omitting ref on an external checkout selects its default branch.
+  - name: Checkout land-surveyors/abcls (explicit ref)
+    if: ${{ inputs.ref != '' }}
+    uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
+    with:
+      repository: land-surveyors/abcls
+      ref: ${{ inputs.ref }}
+      ssh-key: ${{ inputs.ssh-key }}
+      fetch-depth: 1
+      persist-credentials: false
+      path: abcls
+
+  - name: Checkout land-surveyors/abcls (default branch)
+    if: ${{ inputs.ref == '' }}
+    uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
+    with:
+      repository: land-surveyors/abcls
+      ssh-key: ${{ inputs.ssh-key }}
+      fetch-depth: 1
+      persist-credentials: false
+      path: abcls
+
+  - name: Record source
+    shell: bash
+    working-directory: abcls
+    env:
+      REF_INPUT: ${{ inputs.ref }}
+    run: |
+      set -euo pipefail
+      sha="$(git rev-parse HEAD)"
+      branch="$(git branch --show-current)"
+      ref="${branch:-${REF_INPUT}}"
+      # Match the existing workflows: record the SHA, never the commit subject.
+      printf 'Testing land-surveyors/abcls@%s (%s)\n' "${ref}" "${sha}"
+      {
+        printf '## ABCLS test source\n\n'
+        printf -- '- Source: `land-surveyors/abcls@%s`\n' "${ref}"
+        printf -- '- Commit: `%s`\n' "${sha}"
+      } >> "${GITHUB_STEP_SUMMARY}"
+
+  - name: Read pnpm version
+    id: versions
+    shell: bash
+    run: |
+      set -euo pipefail
+      pnpm_version=''
+      while read -r tool version _; do
+        if [[ "${tool}" == 'pnpm' ]]; then
+          pnpm_version="${version}"
+          break
+        fi
+      done < abcls/.tool-versions
+      if [[ -z "${pnpm_version}" ]]; then
+        printf 'error: abcls/.tool-versions must pin pnpm.\n' >&2
+        exit 1
+      fi
+      printf 'pnpm=%s\n' "${pnpm_version}" >> "${GITHUB_OUTPUT}"
+
+  - name: Setup Node.js
+    uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020   # v4.4.0
+    with:
+      node-version-file: abcls/.tool-versions
+
+  - name: Install pnpm
+    shell: bash
+    env:
+      PNPM_VERSION: ${{ steps.versions.outputs.pnpm }}
+    run: npm install --global --ignore-scripts "pnpm@${PNPM_VERSION}"
+
+  - name: Setup NPM packages
+    uses: egose/actions/pnpm-packages@71efad841d4b7bb6a479984abacf7111ebd44a16
+    with:
+      frozen: 'true'
+      ignore-scripts: 'true'
+      paths: ${{ inputs.packages }}

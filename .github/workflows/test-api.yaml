@@ -1,0 +1,94 @@
+# Run the API's Vitest suite from land-surveyors/abcls.
+# Required secret: ABCLS_DEPLOY_KEY (same read-only key as build/deploy).
+# Example:
+#   gh workflow run test-api.yaml -R land-surveyors/abcls-pipelines \
+#     -f ref=main -f filter=admin-email -f coverage=true
+
+name: Test API
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref of land-surveyors/abcls (branch, tag, SHA). Empty = default branch.
+        required: false
+        default: ''
+        type: string
+      filter:
+        description: Optional Vitest test-file path filter (e.g. admin-email or oidc). Empty = all tests.
+        required: false
+        default: ''
+        type: string
+      coverage:
+        description: Generate a V8 coverage report
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref || 'default' }}-${{ inputs.filter }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout pipelines repo
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v4
+      with:
+        persist-credentials: false
+
+    - name: Setup ABCLS tests
+      uses: ./.github/actions/setup-abcls-tests
+      with:
+        ref: ${{ inputs.ref }}
+        ssh-key: ${{ secrets.ABCLS_DEPLOY_KEY }}
+        packages: abcls/api-ts
+
+    - name: Install wkhtmltopdf
+      run: sudo apt-get update && sudo apt-get install -y wkhtmltopdf
+
+    - name: Run API tests
+      working-directory: abcls/api-ts
+      env:
+        CI: 'true'
+        TEST_FILTER: ${{ inputs.filter }}
+        COVERAGE: ${{ inputs.coverage }}
+        # Match the synthetic settings in abcls/.github/workflows/test.yml.
+        STRIPE_SECRET_KEY: sk_test_00000000000000000000000000
+        OIDC_KEYCLOAK_ISSUER_URL: http://localhost:8080/realms/starter/.well-known/openid-configuration
+        OIDC_KEYCLOAK_CLIENT_ID: app
+        OIDC_KEYCLOAK_CLIENT_SECRET: testsecret
+        TMPDIR: ${{ github.workspace }}/abcls/api-ts/node_modules/.cache/test-tmp
+        MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/abcls/api-ts/node_modules/.cache/mongodb-memory-server
+        MONGOMS_PREFER_GLOBAL_PATH: 'false'
+      run: |
+        set -euo pipefail
+        mkdir -p "${TMPDIR}"
+        args=(--reporter=default --reporter=junit --outputFile=results/junit.xml)
+        if [[ "${COVERAGE}" == 'true' ]]; then
+          args+=(--coverage)
+        fi
+        if [[ "${TEST_FILTER}" == -* ]]; then
+          printf 'error: filter must be a test-file path substring, not an option.\n' >&2
+          exit 1
+        fi
+        if [[ -n "${TEST_FILTER}" ]]; then
+          args+=("${TEST_FILTER}")
+        fi
+        pnpm test "${args[@]}"
+
+    - name: Upload API reports
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+      with:
+        name: api-test-reports
+        path: |
+          abcls/api-ts/results/
+          abcls/api-ts/coverage/
+        if-no-files-found: ignore
+        retention-days: 7
